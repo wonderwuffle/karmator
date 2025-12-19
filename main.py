@@ -92,6 +92,32 @@ class Database:
         except Exception as e:
             return {"success": False, "error": str(e)}
 
+    def register_player_without_country_check(
+        self, discord_id, mc_nickname, country_name
+    ):
+        """Регистрирует игрока, даже если страны нет в БД. Возвращает True при успехе."""
+        try:
+            # Проверяем, не зарегистрирован ли уже пользователь
+            if self.check_player(discord_id):
+                return {"success": False, "error": "already_registered"}
+
+            # Регистрируем игрока с указанной страной (даже если её нет в таблице countries)
+            self.cursor.execute(
+                """
+                INSERT INTO players (discordId, mcNickname, country, isLeader)
+                VALUES (?, ?, ?, ?)
+                """,
+                (discord_id, mc_nickname, country_name, False),
+            )
+            self.conn.commit()
+            return {"success": True, "country": country_name}
+        except sqlite3.IntegrityError as e:
+            if "UNIQUE constraint failed" in str(e):
+                return {"success": False, "error": "already_registered"}
+            return {"success": False, "error": str(e)}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
     def check_player(self, discord_id):
         self.cursor.execute(
             "SELECT * FROM players WHERE discordId=?",
@@ -265,16 +291,6 @@ class UserFormModal(Modal, title="📝 Анкета для вайтлиста"):
             )
             return
 
-        # Проверяем существование страны (регистронезависимо)
-        country_check = database.get_country_by_name(self.country.value)
-        if not country_check:
-            await interaction.response.send_message(
-                f"❌ Страна '{self.country.value}' не найдена. "
-                f"Пожалуйста, укажите существующую страну или обратитесь к администратору для создания новой страны.",
-                ephemeral=True,
-            )
-            return
-
         # Отправляем благодарность игроку
         await interaction.response.send_message(
             "✅ Спасибо! Твоя анкета отправлена на рассмотрение. "
@@ -401,6 +417,7 @@ class AcceptButton(Button):
                     ephemeral=True,
                 )
                 return
+
             # 2. ПОИСК РОЛИ ВАЙТЛИСТА
             whitelist_role = guild.get_role(WHITELIST_ROLE_ID)
             if not whitelist_role:
@@ -413,6 +430,7 @@ class AcceptButton(Button):
             mc_username = view.applicant_data["minecraft"]
             country_name = view.applicant_data["country"]
 
+            # Сначала пробуем стандартную регистрацию (если страна существует)
             result_db_member_adding = self.database.register_player(
                 member.id, mc_username, country_name
             )
@@ -424,42 +442,62 @@ class AcceptButton(Button):
                         "❌ Этот игрок уже зарегистрирован в базе данных!",
                         ephemeral=True,
                     )
+                    return
                 elif error_msg == "country_not_found":
-                    await interaction.followup.send(
-                        f"❌ Страна '{country_name}' не найдена в базе данных!",
-                        ephemeral=True,
+                    # Страна не найдена, регистрируем без проверки страны
+                    result_db_member_adding = (
+                        self.database.register_player_without_country_check(
+                            member.id, mc_username, country_name
+                        )
                     )
+
+                    if not result_db_member_adding["success"]:
+                        error_msg = result_db_member_adding.get(
+                            "error", "unknown_error"
+                        )
+                        if error_msg == "already_registered":
+                            await interaction.followup.send(
+                                "❌ Этот игрок уже зарегистрирован в базе данных!",
+                                ephemeral=True,
+                            )
+                        else:
+                            await interaction.followup.send(
+                                f"❌ Ошибка регистрации в БД: {error_msg}",
+                                ephemeral=True,
+                            )
+                        return
+
+                    # Игрок зарегистрирован, но страны нет в БД
+                    actual_country_name = result_db_member_adding["country"]
+                    citizen_role = None
+                    role_status_citizen = f"⚠️ Роль гражданина НЕ ВЫДАНА. Страна '{actual_country_name}' не найдена в системе. Создайте страну через /createcountry и выдайте роль вручную."
                 else:
                     await interaction.followup.send(
                         f"❌ Ошибка регистрации в БД: {error_msg}", ephemeral=True
                     )
-                return
-
-            # 4. ВЫДАЧА РОЛИ ГРАЖДАНИНА
-            citizen_role_id = result_db_member_adding["citizen_role_id"]
-            actual_country_name = result_db_member_adding["country"]
-            citizen_role = guild.get_role(citizen_role_id)
-
-            if not citizen_role:
-                await interaction.followup.send(
-                    f"⚠️ Роль гражданина (ID: {citizen_role_id}) не найдена. Пожалуйста, выдайте роль вручную.",
-                    ephemeral=True,
-                )
-                role_status_citizen = "❌ Роль не найдена"
+                    return
             else:
-                try:
-                    await member.add_roles(
-                        citizen_role, reason="Регистрация гражданина"
-                    )
-                    role_status_citizen = (
-                        f"✅ Роль гражданина '{citizen_role.name}' выдана"
-                    )
-                except discord.Forbidden:
-                    role_status_citizen = "❌ Нет прав для выдачи роли гражданина"
-                except discord.HTTPException as e:
-                    role_status_citizen = f"❌ Ошибка выдачи роли гражданина: {e}"
+                # Стандартный сценарий: страна найдена
+                citizen_role_id = result_db_member_adding["citizen_role_id"]
+                actual_country_name = result_db_member_adding["country"]
+                citizen_role = guild.get_role(citizen_role_id)
 
-            # 5. ВЫДАЧА РОЛИ ВАЙТЛИСТА
+                if not citizen_role:
+                    role_status_citizen = f"⚠️ Роль гражданина (ID: {citizen_role_id}) не найдена. Пожалуйста, выдайте роль вручную."
+                else:
+                    try:
+                        await member.add_roles(
+                            citizen_role, reason="Регистрация гражданина"
+                        )
+                        role_status_citizen = (
+                            f"✅ Роль гражданина '{citizen_role.name}' выдана"
+                        )
+                    except discord.Forbidden:
+                        role_status_citizen = "❌ Нет прав для выдачи роли гражданина"
+                    except discord.HTTPException as e:
+                        role_status_citizen = f"❌ Ошибка выдачи роли гражданина: {e}"
+
+            # 4. ВЫДАЧА РОЛИ ВАЙТЛИСТА
             try:
                 await member.add_roles(whitelist_role, reason="Вайтлист одобрен")
                 role_status_whitelist = (
@@ -479,10 +517,10 @@ class AcceptButton(Button):
                 )
                 return
 
-            # 6. RCON КОМАНДА
+            # 5. RCON КОМАНДА
             rcon_response = await execute_rcon_command(f"easywl add {mc_username}")
 
-            # 7. УВЕДОМЛЕНИЕ ИГРОКА В ЛС
+            # 6. УВЕДОМЛЕНИЕ ИГРОКА В ЛС
             dm_sent = False
             try:
                 embed = discord.Embed(
@@ -503,7 +541,7 @@ class AcceptButton(Button):
             except discord.Forbidden:
                 dm_sent = False
 
-            # 8. ОБНОВЛЕНИЕ СООБЩЕНИЯ С ЗАЯВКОЙ
+            # 7. ОБНОВЛЕНИЕ СООБЩЕНИЯ С ЗАЯВКОЙ
             embed = interaction.message.embeds[0]
             embed.color = discord.Color.green()
             embed.title = f"✅ ЗАЯВКА ОДОБРЕНА ({interaction.user.name})"
@@ -523,7 +561,7 @@ class AcceptButton(Button):
 
             await interaction.message.edit(embed=embed, view=None)
 
-            # 9. ФИНАЛЬНЫЙ ОТВЕТ АДМИНУ
+            # 8. ФИНАЛЬНЫЙ ОТВЕТ АДМИНУ
             message_lines = [
                 f"**✅ Заявка обработана!**",
                 f"👤 Игрок: {member.mention}",
