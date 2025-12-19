@@ -1,9 +1,11 @@
 import asyncio
 import os
+import socket
 import sqlite3
 from typing import List, Optional
 
 import discord
+from aiohttp import web
 from discord import app_commands
 from discord.ui import Button, Modal, TextInput, View
 from rcon.source import Client
@@ -1052,10 +1054,79 @@ async def on_ready():
             print(f"⚠️ Ошибка отправки сообщения: {e}")
 
 
+async def health_check_handler(request):
+    """Обработчик для проверки здоровья бота"""
+    return web.Response(text="Discord bot is running")
+
+
+async def start_background_server(host="0.0.0.0", port=8080):
+    """Запуск фонового HTTP-сервера для поддержания работы бота"""
+    app = web.Application()
+    app.router.add_get("/", health_check_handler)
+    app.router.add_get("/health", health_check_handler)
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+
+    site = web.TCPSite(runner, host, port)
+    await site.start()
+
+    print(f"✅ HTTP-сервер запущен на порту {port}")
+    return runner
+
+
+def is_port_available(port=8080):
+    """Проверка доступности порта"""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        try:
+            s.bind(("0.0.0.0", port))
+            return True
+        except OSError:
+            return False
+
+
+async def start_bot_with_server():
+    """Основная функция для запуска бота и HTTP-сервера"""
+    try:
+        # Запускаем HTTP-сервер в фоне
+        runner = await start_background_server()
+
+        # Запускаем Discord бота
+        await bot.start(TOKEN)
+
+    except Exception as e:
+        print(f"❌ Ошибка при запуске: {e}")
+        raise
+    finally:
+        # Останавливаем HTTP-сервер при выходе
+        await runner.cleanup()
+
+
 # ========== ЗАПУСК БОТА ==========
 if __name__ == "__main__":
     global database
     database = Database()
     if database is not None:
         print("БД успешно инициализирована!")
-    bot.run(TOKEN)
+
+    # Проверяем доступность порта
+    if not is_port_available(8080):
+        print("⚠️ Порт 8080 занят, пробуем порт 8081")
+        port = 8081
+    else:
+        port = 8080
+
+    print(f"🎯 Используем порт для health check: {port}")
+
+    # Запускаем бота с HTTP-сервером
+    try:
+        # Создаем новый event loop для asyncio
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+
+        # Запускаем основную задачу
+        loop.run_until_complete(start_bot_with_server())
+    except KeyboardInterrupt:
+        print("👋 Бот остановлен пользователем")
+    except Exception as e:
+        print(f"❌ Критическая ошибка: {e}")
